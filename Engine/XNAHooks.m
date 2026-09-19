@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <os/log.h>
 #import <objc/runtime.h>
+#import <stdatomic.h>
 #import <string.h>
 #import "XNAPattern.h"
 
@@ -19,15 +20,22 @@ static NSMutableArray<NSString *> *XNAJournal(void) {
     return journal;
 }
 
+// 进程起点的 uptime，日志按它做相对时间戳。
+static NSTimeInterval XNALaunchUptime = 0;
+
 static void XNALog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
-    NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
+    // 不记时间的话，事后根本分不清开屏那几百毫秒里谁先谁后。
+    NSString *line = [NSString stringWithFormat:@"+%7.3f %@",
+                      NSProcessInfo.processInfo.systemUptime - XNALaunchUptime, message];
     os_log(XNALogger(), "%{public}@", line);
     @synchronized(XNAJournal()) {
         [XNAJournal() addObject:line];
-        if (XNAJournal().count > 600) [XNAJournal() removeObjectsInRange:NSMakeRange(0, XNAJournal().count - 600)];
+        // 留够篇幅：一次全量扫描就要写上千行钩子记录，再早的环形裁剪会把开屏那段时序挤掉。
+        if (XNAJournal().count > 2500) [XNAJournal() removeObjectsInRange:NSMakeRange(0, XNAJournal().count - 2500)];
     }
 }
 
@@ -240,7 +248,8 @@ static BOOL XNASignaturePortable(const char *encoding, char *returnType) {
     }
 }
 
-static NSUInteger XNAHookedCount = 0;
+// 主线程那次热扫描和后台全量扫描可能同时在挂，计数用原子量。
+static _Atomic NSUInteger XNAHookedCount = 0;
 
 // 只处理 App 自带可执行文件与内嵌框架里的类，系统框架一律跳过。
 static BOOL XNAClassIsAppOwned(Class cls) {
@@ -258,7 +267,7 @@ static void XNAHookMethod(Class cls, Method method, BOOL isClassMethod) {
     IMP replacement = XNADefuseIMP(original, returnType);
     if (!replacement || original == replacement) return;
     method_setImplementation(method, replacement);
-    XNAHookedCount++;
+    atomic_fetch_add_explicit(&XNAHookedCount, 1, memory_order_relaxed);
     XNALog(@"defuse-hook %@[%@ %@] %s", isClassMethod ? @"+@" : @"-", NSStringFromClass(cls),
            NSStringFromSelector(selector), method_getTypeEncoding(method));
 }
@@ -271,12 +280,11 @@ static NSMutableSet<NSString *> *XNAVisited(void) {
 }
 
 static void XNAInstallIn(Class cls) {
-    const char *className = class_getName(cls);
     for (BOOL classMethod = NO;; classMethod = YES) {
         unsigned int count = 0;
         Method *methods = class_copyMethodList(classMethod ? object_getClass(cls) : cls, &count);
         for (unsigned int i = 0; i < count; i++) {
-            if (XNAActionForClass(className, sel_getName(method_getName(methods[i]))) != XNAActionNone) {
+            if (XNAIsPresentationSelector(sel_getName(method_getName(methods[i])))) {
                 XNAHookMethod(cls, methods[i], classMethod);
             }
         }
@@ -285,45 +293,64 @@ static void XNAInstallIn(Class cls) {
     }
 }
 
-static void XNAInstallAll(NSString *pass) {
+// 扫描全在一条自己的串行队列上做，主线程只负责开屏那一批。
+static dispatch_queue_t XNAInstallQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.moxuan.xrknoad.install", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(queue, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    });
+    return queue;
+}
+
+// launchOnly 为真时只挂开屏/启动广告那批类，必须在主线程构造函数里同步做完；
+// 全量扫描放后台：v0.0.2 把 5 万个类的规则匹配压在构造函数里，冷启动就这么卡了 2 秒。
+static void XNAInstallAll(NSString *pass, BOOL launchOnly) {
     NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     NSUInteger scanned = 0;
     for (unsigned int i = 0; i < count; i++) {
         const char *name = class_getName(classes[i]);
-        if (!XNAIsInterestingClassName(name)) continue;
+        if (launchOnly ? !XNAIsLaunchClassName(name) : !XNAIsInterestingClassName(name)) continue;
+        if (!XNAClassIsAppOwned(classes[i])) continue;
         NSString *key = @(name);
         @synchronized(XNAVisited()) {
+            // 先占名再挂，重复的 pass 和并发的两条 pass 都不会把方法套两层。
             if ([XNAVisited() containsObject:key]) continue;
             [XNAVisited() addObject:key];
         }
         scanned++;
-        if (XNAClassIsAppOwned(classes[i])) XNAInstallIn(classes[i]);
+        XNAInstallIn(classes[i]);
     }
     free(classes);
     XNALog(@"pass %@: %u classes, %lu candidates, %lu hooks in %.0f ms", pass, count, (unsigned long)scanned,
-           (unsigned long)XNAHookedCount, (NSProcessInfo.processInfo.systemUptime - started) * 1000);
+           (unsigned long)atomic_load_explicit(&XNAHookedCount, memory_order_relaxed),
+           (NSProcessInfo.processInfo.systemUptime - started) * 1000);
     XNAFlushLog();
 }
 
 __attribute__((constructor)) static void XrkNoAdEntry(void) {
     @autoreleasepool {
+        XNALaunchUptime = NSProcessInfo.processInfo.systemUptime;
         XNALog(@"XrkNoAd attached to %@ / %@", NSProcessInfo.processInfo.processName,
                NSBundle.mainBundle.bundleIdentifier);
-        XNAInstallAll(@"eager");
-        // 广告视图类大多要等第一次请求广告时才注册，热启动那次也必须重新扫一遍。
-        for (NSNumber *delay in @[ @2, @5, @15, @40 ]) {
+        XNAInstallAll(@"launch", YES);
+        // 广告视图类大多要等第一次请求广告时才注册，所以要反复补扫；热启动回前台同理。
+        for (NSNumber *delay in @[ @0.2, @2, @5, @15, @40 ]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                               XNAInstallAll(@"late");
+                           XNAInstallQueue(), ^{
+                               XNAInstallAll(@"full", NO);
                            });
         }
         id observer = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
                                                                      object:nil
-                                                                        queue:NSOperationQueue.mainQueue
+                                                                        queue:nil
                                                                    usingBlock:^(NSNotification *note) {
-                                                                       XNAInstallAll(@"active");
+                                                                       dispatch_async(XNAInstallQueue(), ^{
+                                                                           XNAInstallAll(@"active", NO);
+                                                                       });
                                                                    }];
         XNAKeep(observer);
     }
