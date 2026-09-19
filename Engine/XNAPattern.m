@@ -24,7 +24,8 @@ typedef struct {
     "*AdRender*|*ADRender*|*AdDispatcher*|*AdProxy*|*AdAdapter*|*AdCustomEvent*|" \
     "AD*|ADTEST*|ADTest*|ADFullScreenViewController|ADTestViewController|"     \
     "DeviceADTableViewCell|HistoryADView|ReserveCentralADView|InsertAdBottomView|" \
-    "DiscoverAdTableViewCell|AdPlaceholderView|AdModel|Advert"
+    "DiscoverAdTableViewCell|AdPlaceholderView|AdModel|Advert|"                \
+    "VipRemind*|RCVipPrompt*"
 
 // 只挂「展示」这一层：原实现照常跑完，SDK 的加载、倒计时、关闭回调都不被截断，
 // 宿主 App 的开屏流程因此不会卡住（v0.0.1 直接 stub load*/start* 就是把这条链掐断了）。

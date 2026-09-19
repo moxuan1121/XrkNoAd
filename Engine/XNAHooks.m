@@ -308,6 +308,65 @@ static void XNAInstallIn(Class cls) {
     }
 }
 
+#pragma mark - overlay probe
+
+// 「当前使用免费服务，建议升级…」这类推广弹窗不是广告 SDK 的类，而是 App 自己的视图，
+// 光靠类名猜会漏。所以每秒瞄一眼界面层，把新冒出来的 App 自有视图记进日志：
+// 下一份日志就能直接点名是谁弹的，再决定挂谁。只记不拦。
+static NSHashTable<UIView *> *XNASeenViews(void) {
+    static NSHashTable *seen;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSHashTable weakObjectsHashTable]; });
+    return seen;
+}
+
+static BOOL XNALooksLikeOverlayHost(NSString *className) {
+    static NSArray<NSString *> *markers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        markers = @[ @"Vip", @"Remind", @"Prompt", @"Upgrade", @"Dialog", @"Popup", @"Alert", @"Toast", @"Tip" ];
+    });
+    for (NSString *marker in markers) {
+        if ([className rangeOfString:marker].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static NSString *XNAViewText(UIView *view) {
+    if ([view isKindOfClass:UILabel.class]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:UIButton.class]) return ((UIButton *)view).currentTitle;
+    if ([view isKindOfClass:UIControl.class]) return ((UIControl *)view).accessibilityLabel;
+    return nil;
+}
+
+static void XNAScanOverlays(void) {
+    static BOOL baselined = NO;
+    BOOL report = baselined;
+    baselined = YES;
+    NSMutableArray<UIView *> *queue = [NSMutableArray array];
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window) [queue addObject:window];
+    }
+    NSUInteger visited = 0;
+    while (queue.count && visited < 900) {
+        UIView *view = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        visited++;
+        [queue addObjectsFromArray:view.subviews];
+        BOOL fresh = ![XNASeenViews() containsObject:view];
+        [XNASeenViews() addObject:view];
+        if (!fresh || !report) continue;
+        if (view.isHidden || view.alpha < 0.05 || !view.window) continue;
+        if (!XNAClassIsAppOwned(view.class)) continue;
+        NSString *className = NSStringFromClass(view.class);
+        // 直接挂在窗口上的新视图一律记（弹窗都这么干）；藏在页面深处的只记名字像推广的。
+        if (![view.superview isKindOfClass:UIWindow.class] && !XNALooksLikeOverlayHost(className)) continue;
+        NSString *text = XNAViewText(view);
+        XNALog(@"overlay %@ frame=%@ text=%@", className, NSStringFromRect(view.frame), text ?: @"-");
+    }
+    if (report) XNAFlushLog();
+}
+
 // 扫描全在一条自己的串行队列上做，主线程只负责开屏那一批。
 static dispatch_queue_t XNAInstallQueue(void) {
     static dispatch_queue_t queue;
@@ -355,6 +414,10 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
         XNALog(@"XrkNoAd attached to %@ / %@", NSProcessInfo.processInfo.processName,
                NSBundle.mainBundle.bundleIdentifier);
         XNAInstallAll(@"launch", YES);
+        // 先认出来才能屏蔽：主线程每秒扫一遍界面层，把新出现的 App 自有视图记进日志。
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+            XNAScanOverlays();
+        }];
         // 广告视图类大多要等第一次请求广告时才注册，所以要反复补扫；热启动回前台同理。
         for (NSNumber *delay in @[ @0.2, @2, @5, @15, @(XNAStartupWindow - 5) ]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
