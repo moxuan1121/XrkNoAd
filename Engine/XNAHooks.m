@@ -37,7 +37,7 @@ static void XNAFlushLog(void) {
     @synchronized(XNAJournal()) {
         snapshot = [XNAJournal() copy];
     }
-    [snapshot componentsJoinedByString:@"\n"] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    [[snapshot componentsJoinedByString:@"\n"] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 }
 
 static NSMutableArray<id> *XNAKeepAlive(void) {
