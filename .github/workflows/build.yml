@@ -46,11 +46,12 @@ jobs:
           magic, cpu, subtype = struct.unpack_from('<III', dylib.read_bytes())
           assert magic == 0xfeedfacf and cpu == 0x100000c, 'expected thin ARM64 Mach-O'
           assert subtype == 0x0, f'expected plain arm64 to match the host app, got {subtype:#x}'
-          # 第一行是 LC_ID_DYLIB 安装名（含 MobileSubstrate 目录），依赖从第二行开始
+          # otool 前两行分别是文件路径与自身 install name（含 MobileSubstrate 目录），只比对依赖的 basename
           out = subprocess.check_output(['otool', '-L', str(dylib)], text=True)
-          deps = [line.strip().split(' (')[0] for line in out.splitlines()[1:]]
-          assert not any('ubstrate' in d.lower() or 'ellekit' in d.lower() for d in deps), deps
-          print('\n'.join(deps))
+          names = [line.strip().split(' (')[0].rsplit('/', 1)[-1] for line in out.splitlines() if line.startswith('\t')]
+          names = [n for n in names if n != dylib.name]
+          assert not any('substrate' in n.lower() or 'ellekit' in n.lower() for n in names), names
+          print(names)
           packages = list(pathlib.Path('packages').glob('*.deb'))
           assert len(packages) == 1, f'expected one deb, got {len(packages)}'
           print('built', packages[0], dylib)
