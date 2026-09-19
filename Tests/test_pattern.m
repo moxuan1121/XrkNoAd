@@ -97,8 +97,8 @@ int main(void) {
         }
 
         // 类名：拿真机二进制的类名表回归，快速路径和逐条通配匹配不能有半个字的分歧。
-        NSString *corpusPath = ProcessInfo.processInfo.arguments.count > 1
-                                   ? ProcessInfo.processInfo.arguments[1]
+        NSString *corpusPath = NSProcessInfo.processInfo.arguments.count > 1
+                                   ? NSProcessInfo.processInfo.arguments[1]
                                    : @"Tests/corpus_classes.txt";
         NSString *corpus = [NSString stringWithContentsOfFile:corpusPath encoding:NSUTF8StringEncoding error:NULL];
         if (!corpus) {
