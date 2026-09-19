@@ -1,5 +1,4 @@
 #import "XNAPattern.h"
-#import <objc/runtime.h>
 #import <string.h>
 
 typedef struct {
@@ -8,30 +7,32 @@ typedef struct {
     XNAAction action;
 } XNARule;
 
-#define XNA_AD_NAMES \
-    "AT*|BU*|CSJ*|GDT*|GAD*|MS*|UMP*|UMUnion*|UADS*|Taku*|WM*|Baidu*|Smartdigimkt*|KSAd*|KSAD*|" \
-    "TopOn*|Klevin*|Octopus*|beizi*|BZ*|IS*|ISA*|AD*|*AD*|*Ad|*Ads|*AD|" \
-    "*AdManager|*ADManager|*SplashAd|*BannerAd|*InterstitialAd|*IntersititialAd|*NativeAd|*NativeAD|" \
-    "*RewardedVideoAd|*AppOpenAd|*AdLoader|*AdModel|*ADModel|*AdInfo|*ADInfo|*InsertAd*|*AdSlot|*ADSlot"
+// 前缀取自 App 自身符号表：AT* 是 TopOn，BU*/CSJ* 是穿山甲，GDT*/GAD* 是优量汇，MS*/SDM* 是美数，
+// UMP* 是友盟 PUnion，WM*/Taku* 是 Taku，Baidu*/BDMob* 是百度，ISA*/IS*Ad* 是 IronSource AdQuality。
+// 匹配区分大小写，且刻意不写 Ad*：业务侧有 AddDeviceViewController 这类以 Ad 开头的类名。
+// 三段拼接：广告 SDK 自带的类、名字里带广告术语的类、App 自己的广告界面。
+#define XNA_AD_CLASSES                                                         \
+    "AT*|BU*|CSJ*|GDT*|GAD*|GAM*|GMA*|MS*|UMP*|UMUnion*|UADS*|Taku*|WM*|"      \
+    "Baidu*|BDMob*|Smartdigimkt*|SDM*|MeiShu*|KSAd*|KSAD*|TopOn*|Klevin*|"     \
+    "Octopus*|beizi*|HyBid*|FAD*|FBAd*|FBInterstitial*|FBRewarded*|CHB*|DTB*|" \
+    "ALAd*|BidMachine*|ISA*|ISDK*|ISImpression*|IS*Ad*|"                       \
+    "*AD*|*Ad|*Ads|*Splash*|*InsertAd*|*Interstitial*|*Intersititial*|"        \
+    "*BannerAd*|*NativeAd*|*NativeAD*|*RewardedVideo*|*RewardVideo*|*AppOpenAd*|" \
+    "*AdView*|*ADView*|*AdManager*|*ADManager*|*AdLoader*|*AdModel*|*ADModel*|" \
+    "*AdInfo*|*ADInfo*|*AdSlot*|*ADSlot*|*AdContainer*|*AdSource*|*Mediation*|" \
+    "*AdRender*|*ADRender*|*AdDispatcher*|*AdProxy*|*AdAdapter*|*AdCustomEvent*|" \
+    "AD*|ADTEST*|ADTest*|ADFullScreenViewController|ADTestViewController|"     \
+    "DeviceADTableViewCell|HistoryADView|ReserveCentralADView|InsertAdBottomView|" \
+    "DiscoverAdTableViewCell|AdPlaceholderView|AdModel|Advert"
 
-#define XNA_SDK_INIT_SEL "start*|setUp*|setup*|init*|configure*|register*|load*Config*|request*Config*"
-
-#define XNA_AD_VERB_SEL "load*|show*|fetch*|request*|render*|prepare*|getAd*|start*"
-
-#define XNA_APP_DATA "ADInfo*|ADRule|*AdManager|*ADManager|InsertAdManager|TakuADManager|WMADManager"
-
-#define XNA_AD_UI \
-    "ADFullScreenViewController|ADTestViewController|ADTESTTableViewCell|DeviceADTableViewCell|HistoryADView|" \
-    "ReserveCentralADView|*AdViewController|*ADViewController|*SplashViewController|*InterstitialViewController|" \
-    "ATAlertViewController|ATAccidentalClickView"
-
-#define XNA_AD_UI_SEL "viewDidAppear:|viewWillAppear:|layoutSubviews|didMoveToWindow|showAd*"
+// 只挂「展示」这一层：原实现照常跑完，SDK 的加载、倒计时、关闭回调都不被截断，
+// 宿主 App 的开屏流程因此不会卡住（v0.0.1 直接 stub load*/start* 就是把这条链掐断了）。
+#define XNA_PRESENT_SEL                                                          \
+    "viewDidAppear:|viewWillAppear:|viewDidLayoutSubviews|didMoveToWindow|"      \
+    "willMoveToWindow:|layoutSubviews|makeKeyAndVisible|show*|present*|render*"
 
 static const XNARule XNARules[] = {
-    { XNA_AD_NAMES, XNA_SDK_INIT_SEL, XNAActionStub },
-    { XNA_AD_NAMES, XNA_AD_VERB_SEL, XNAActionStub },
-    { XNA_APP_DATA, "*", XNAActionStubData },
-    { XNA_AD_UI, XNA_AD_UI_SEL, XNAActionDefuse },
+    { XNA_AD_CLASSES, XNA_PRESENT_SEL, XNAActionDefuse },
 };
 
 static const char *XNAForbiddenSelectors[] = {
@@ -40,9 +41,7 @@ static const char *XNAForbiddenSelectors[] = {
     "copy", "copyWithZone:", "init", "new", "viewDidLoad", "encodeWithCoder:", "initWithCoder:", "description",
 };
 
-static const char *XNADataGetterPrefixes[] = {
-    "get", "fetch", "ad", "AD", "current", "request", "load", "is", "has",
-};
+static const char *XNASplashMarkers[] = { "Splash", "splash", "SPLASH", "LaunchAd", "launchad" };
 
 BOOL XNAIsInterestingClassName(const char *name) {
     if (!name) return NO;
@@ -65,10 +64,10 @@ XNAAction XNAActionForClass(const char *className, const char *selector) {
     return XNAActionNone;
 }
 
-BOOL XNAIsDataGetter(const char *selector, NSUInteger argumentCount) {
-    if (!selector || argumentCount != 2) return NO;
-    for (size_t i = 0; i < sizeof(XNADataGetterPrefixes) / sizeof(XNADataGetterPrefixes[0]); i++) {
-        if (!strncmp(selector, XNADataGetterPrefixes[i], strlen(XNADataGetterPrefixes[i]))) return YES;
+BOOL XNAIsSplashLikeName(const char *name) {
+    if (!name) return NO;
+    for (size_t i = 0; i < sizeof(XNASplashMarkers) / sizeof(XNASplashMarkers[0]); i++) {
+        if (strstr(name, XNASplashMarkers[i])) return YES;
     }
     return NO;
 }

@@ -47,27 +47,188 @@ static NSMutableArray<id> *XNAKeepAlive(void) {
     return kept;
 }
 
-#pragma mark - stubs
+static void XNAKeep(id object) {
+    @synchronized(XNAKeepAlive()) {
+        [XNAKeepAlive() addObject:object];
+    }
+}
 
-static BOOL XNASelectorReturnsCollection(const char *selector) {
-    static const char *const markers[] = { "Array", "List", "Models", "Infos", "Items", "Ads", "ADs", "Results" };
-    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
-        if (strstr(selector, markers[i])) return YES;
+static NSUInteger XNAActionCount = 0;
+
+#pragma mark - skip button
+
+// 只认「跳过」：这类按钮按下后广告会走自己的关闭分支，宿主 App 拿得到回调。
+// 「关闭」一类的不点——它可能属于业务弹窗，而且误触广告比广告本身更糟。
+static BOOL XNAMatchSkipText(NSString *text) {
+    static NSArray<NSString *> *keywords;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ keywords = @[ @"跳过", @"skip" ]; });
+    if (text.length == 0) return NO;
+    NSString *lower = text.lowercaseString;
+    for (NSString *keyword in keywords) {
+        if ([lower rangeOfString:keyword].location != NSNotFound) return YES;
     }
     return NO;
 }
 
-static void XNAStubVoid(id self, SEL _cmd) {}
-
-static NSInteger XNAStubScalar(id self, SEL _cmd) { return 0; }
-
-static double XNAStubNumber(id self, SEL _cmd) { return 0; }
-
-static id XNAStubObject(id self, SEL _cmd) {
-    return XNASelectorReturnsCollection(sel_getName(_cmd)) ? (id)@[] : nil;
+static BOOL XNALooksLikeSkip(UIControl *control) {
+    if ([control isKindOfClass:UIButton.class]) {
+        UIButton *button = (UIButton *)control;
+        if (XNAMatchSkipText(button.currentTitle) || XNAMatchSkipText(button.currentAttributedTitle.string)) return YES;
+    }
+    if (control.allTargets.count == 0) return NO;
+    return XNAMatchSkipText(control.accessibilityLabel) || XNAMatchSkipText(control.accessibilityValue);
 }
 
-static BOOL XNASignatureStubbable(const char *encoding, char *returnType) {
+// 广度优先找广告自带的跳过按钮，限定在这块广告视图内部，避免点到业务界面的同名按钮。
+static NSUInteger XNATrySkipInView(UIView *root) {
+    static const NSUInteger XNAMaxNodes = 400;
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root];
+    NSUInteger tapped = 0, visited = 0;
+    while (queue.count && visited < XNAMaxNodes) {
+        UIView *view = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        visited++;
+        if (view != root && [view isKindOfClass:UIControl.class] && XNALooksLikeSkip((UIControl *)view)) {
+            [(UIControl *)view sendActionsForControlEvents:UIControlEventTouchUpInside];
+            tapped++;
+            continue;
+        }
+        [queue addObjectsFromArray:view.subviews];
+    }
+    return tapped;
+}
+
+static const void *XNASkipStateKey = &XNASkipStateKey;
+
+// 跳过按钮往往要等广告素材到位才建出来，所以按节流重试几次，而不是一次定终身。
+static void XNASkipIfNeeded(UIView *view, NSString *className) {
+    if (!view) return;
+    NSMutableArray *state = objc_getAssociatedObject(view, XNASkipStateKey);
+    if (!state) {
+        state = [NSMutableArray arrayWithObjects:@0, @0, nil];
+        objc_setAssociatedObject(view, XNASkipStateKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    static const NSInteger XNAMaxSkipAttempts = 6;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if ([state[0] integerValue] >= XNAMaxSkipAttempts || now - [state[1] doubleValue] < 0.5) return;
+    state[0] = @([state[0] integerValue] + 1);
+    state[1] = @(now);
+    NSUInteger tapped = XNATrySkipInView(view);
+    if (tapped) {
+        state[0] = @(XNAMaxSkipAttempts);
+        XNALog(@"skip-button %@ x%lu", className, (unsigned long)tapped);
+    }
+}
+
+#pragma mark - defuse
+
+static void XNAReleaseViewController(UIViewController *vc) {
+    UIViewController *presenter = vc.presentingViewController;
+    if (presenter.presentedViewController == vc) {
+        [presenter dismissViewControllerAnimated:NO completion:nil];
+        return;
+    }
+    UINavigationController *nav = vc.navigationController;
+    if (nav.viewControllers.count > 1 && nav.viewControllers.lastObject == vc) {
+        [nav popViewControllerAnimated:NO];
+    }
+}
+
+// 广告视图常被复用（热启动第二次起就是同一个对象），所以只要它又变成可见的，
+// 就重置跳过重试的配额，让它重新有机会按下跳过。
+static void XNAHideAndSkip(UIView *view, NSString *className) {
+    if (!view) return;
+    if (!view.isHidden) {
+        objc_setAssociatedObject(view, XNASkipStateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    view.hidden = YES;
+    view.alpha = 0;
+    XNASkipIfNeeded(view, className);
+}
+
+static void XNADefuse(id target) {
+    if (!target) return;
+    NSString *className = NSStringFromClass(object_getClass(target));
+    BOOL splash = XNAIsSplashLikeName(className.UTF8String);
+    void (^work)(void) = ^{
+        XNAActionCount++;
+        if ([target isKindOfClass:UIWindow.class]) {
+            XNAHideAndSkip(target, className);
+            XNALog(@"defuse window %@", className);
+        } else if ([target isKindOfClass:UIViewController.class]) {
+            UIViewController *vc = target;
+            if (vc.isViewLoaded) XNAHideAndSkip(vc.view, className);
+            // 兜底：插屏/激励可能没有自动关闭，宽限期后替它离场，别让用户对着一个看不见的模态。
+            // 开屏的宽限期给足，倒计时跑完 SDK 会自己关，抢先销毁反而拿不到回调。
+            NSTimeInterval grace = splash ? 8 : 1.2;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(grace * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                               XNAReleaseViewController(vc);
+                           });
+            XNALog(@"defuse vc %@ splash=%d", className, splash);
+        } else if ([target isKindOfClass:UIView.class]) {
+            UIView *view = target;
+            XNAHideAndSkip(view, className);
+            // 开屏视图留在视图树里，SDK 的倒计时和关闭回调才能继续跑；其它广告直接摘掉。
+            if (!splash && view.superview) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [view removeFromSuperview];
+                });
+            }
+            XNALog(@"defuse view %@ splash=%d", className, splash);
+        }
+        if ((XNAActionCount % 25) == 0) XNAFlushLog();
+    };
+    if (NSThread.isMainThread) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
+}
+
+static IMP XNADefuseIMP(IMP original, char returnType) {
+    switch (returnType) {
+        case '@': {
+            id (^block)(id, SEL, void *, void *, void *) = ^(id self, SEL _cmd, void *a0, void *a1, void *a2) {
+                id result = ((id(*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2);
+                XNADefuse(self);
+                return result;
+            };
+            XNAKeep(block);
+            return imp_implementationWithBlock(block);
+        }
+        case 'f': {
+            float (^block)(id, SEL, void *, void *, void *) = ^(id self, SEL _cmd, void *a0, void *a1, void *a2) {
+                float result = ((float(*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2);
+                XNADefuse(self);
+                return result;
+            };
+            XNAKeep(block);
+            return imp_implementationWithBlock(block);
+        }
+        case 'd': {
+            double (^block)(id, SEL, void *, void *, void *) = ^(id self, SEL _cmd, void *a0, void *a1, void *a2) {
+                double result = ((double(*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2);
+                XNADefuse(self);
+                return result;
+            };
+            XNAKeep(block);
+            return imp_implementationWithBlock(block);
+        }
+        default: {
+            // 'v' 忽略返回值；BOOL/char/int/long 都只看 x0 的低 32 位，按 NSInteger 转发即可。
+            NSInteger (^block)(id, SEL, void *, void *, void *) = ^(id self, SEL _cmd, void *a0, void *a1, void *a2) {
+                NSInteger result = ((NSInteger(*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2);
+                XNADefuse(self);
+                return result;
+            };
+            XNAKeep(block);
+            return imp_implementationWithBlock(block);
+        }
+    }
+}
+
+#pragma mark - installation
+
+static BOOL XNASignaturePortable(const char *encoding, char *returnType) {
     if (!encoding || !*encoding) return NO;
     switch (encoding[0]) {
         case 'v': case '@': case '#': case '*': case '^': case 'B': case 'c': case 'i': case 's':
@@ -79,74 +240,6 @@ static BOOL XNASignatureStubbable(const char *encoding, char *returnType) {
     }
 }
 
-static IMP XNAStubForReturnType(char type) {
-    switch (type) {
-        case 'v': return (IMP)XNAStubVoid;
-        case '@': return (IMP)XNAStubObject;
-        case 'f': case 'd': return (IMP)XNAStubNumber;
-        default: return (IMP)XNAStubScalar;
-    }
-}
-
-#pragma mark - defuse
-
-static const void *XNADefusedKey = &XNADefusedKey;
-
-static void XNADefuse(id target) {
-    if (!target) return;
-    @synchronized(target) {
-        if (objc_getAssociatedObject(target, XNADefusedKey)) return;
-        objc_setAssociatedObject(target, XNADefusedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    void (^work)(void) = ^{
-        if ([target isKindOfClass:UIViewController.class]) {
-            UIViewController *vc = target;
-            if (vc.isViewLoaded) {
-                vc.view.hidden = YES;
-                vc.view.alpha = 0;
-            }
-            if (vc.presentingViewController) {
-                [vc.presentingViewController dismissViewControllerAnimated:NO completion:nil];
-            } else if (vc.navigationController.viewControllers.count > 1 &&
-                       vc.navigationController.viewControllers.lastObject == vc) {
-                [vc.navigationController popViewControllerAnimated:NO];
-            }
-            return;
-        }
-        if ([target isKindOfClass:UIView.class]) {
-            UIView *view = target;
-            view.hidden = YES;
-            view.alpha = 0;
-            UIView *parent = view.superview;
-            if (parent) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [view removeFromSuperview];
-                });
-            }
-        }
-    };
-    if (NSThread.isMainThread) work();
-    else dispatch_async(dispatch_get_main_queue(), work);
-}
-
-static IMP XNADefuseIMP(IMP original, char returnType) {
-    void (^block)(id, SEL, void *, void *, void *) = ^(id self, SEL _cmd, void *a0, void *a1, void *a2) {
-        switch (returnType) {
-            case '@': ((id (*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2); break;
-            case 'f': case 'd': ((double (*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2); break;
-            case 'v': ((void (*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2); break;
-            default: ((NSInteger(*)(id, SEL, void *, void *, void *))original)(self, _cmd, a0, a1, a2); break;
-        }
-        XNADefuse(self);
-    };
-    @synchronized(XNAKeepAlive()) {
-        [XNAKeepAlive() addObject:block];
-    }
-    return imp_implementationWithBlock(block);
-}
-
-#pragma mark - installation
-
 static NSUInteger XNAHookedCount = 0;
 
 // 只处理 App 自带可执行文件与内嵌框架里的类，系统框架一律跳过。
@@ -155,40 +248,37 @@ static BOOL XNAClassIsAppOwned(Class cls) {
     return image && strstr(image, ".app/");
 }
 
-static void XNAHookMethod(Class cls, Method method, BOOL isClassMethod, XNAAction action) {
+static void XNAHookMethod(Class cls, Method method, BOOL isClassMethod) {
     SEL selector = method_getName(method);
-    const char *selectorName = sel_getName(selector);
-    const char *encoding = method_getTypeEncoding(method);
     char returnType = 'v';
-    if (!XNASignatureStubbable(encoding, &returnType)) {
-        if (XNAHookedCount < 40) {
-            XNALog(@"skip [%@ %@] unsafe return %s", NSStringFromClass(cls), NSStringFromSelector(selector),
-                   encoding ?: "?");
-        }
-        return;
-    }
-    if (action == XNAActionStubData && !XNAIsDataGetter(selectorName, method_getNumberOfArguments(method))) {
-        return;
-    }
+    if (!XNASignaturePortable(method_getTypeEncoding(method), &returnType)) return;
+    // 转发垫片只带 3 个指针参数，self/_cmd 之外更多参数的方法一律不动。
+    if (method_getNumberOfArguments(method) > 5) return;
     IMP original = method_getImplementation(method);
-    IMP replacement = action == XNAActionDefuse ? XNADefuseIMP(original, returnType) : XNAStubForReturnType(returnType);
+    IMP replacement = XNADefuseIMP(original, returnType);
     if (!replacement || original == replacement) return;
     method_setImplementation(method, replacement);
     XNAHookedCount++;
-    XNALog(@"%@ %@[%@ %@] %s", action == XNAActionDefuse ? @"defuse" : @"stub", isClassMethod ? @"+@" : @"-",
-           NSStringFromClass(cls), NSStringFromSelector(selector), encoding);
+    XNALog(@"defuse-hook %@[%@ %@] %s", isClassMethod ? @"+@" : @"-", NSStringFromClass(cls),
+           NSStringFromSelector(selector), method_getTypeEncoding(method));
+}
+
+static NSMutableSet<NSString *> *XNAVisited(void) {
+    static NSMutableSet *visited;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ visited = [NSMutableSet new]; });
+    return visited;
 }
 
 static void XNAInstallIn(Class cls) {
-    if (!cls || class_isMetaClass(cls) || !XNAClassIsAppOwned(cls)) return;
     const char *className = class_getName(cls);
     for (BOOL classMethod = NO;; classMethod = YES) {
         unsigned int count = 0;
         Method *methods = class_copyMethodList(classMethod ? object_getClass(cls) : cls, &count);
         for (unsigned int i = 0; i < count; i++) {
-            SEL selector = method_getName(methods[i]);
-            XNAAction action = XNAActionForClass(className, sel_getName(selector));
-            if (action != XNAActionNone) XNAHookMethod(cls, methods[i], classMethod, action);
+            if (XNAActionForClass(className, sel_getName(method_getName(methods[i]))) != XNAActionNone) {
+                XNAHookMethod(cls, methods[i], classMethod);
+            }
         }
         free(methods);
         if (classMethod) break;
@@ -199,14 +289,20 @@ static void XNAInstallAll(NSString *pass) {
     NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
-    NSUInteger matched = 0;
+    NSUInteger scanned = 0;
     for (unsigned int i = 0; i < count; i++) {
-        if (!XNAIsInterestingClassName(class_getName(classes[i]))) continue;
-        matched++;
-        XNAInstallIn(classes[i]);
+        const char *name = class_getName(classes[i]);
+        if (!XNAIsInterestingClassName(name)) continue;
+        NSString *key = @(name);
+        @synchronized(XNAVisited()) {
+            if ([XNAVisited() containsObject:key]) continue;
+            [XNAVisited() addObject:key];
+        }
+        scanned++;
+        if (XNAClassIsAppOwned(classes[i])) XNAInstallIn(classes[i]);
     }
     free(classes);
-    XNALog(@"pass %@: %u classes, %lu candidates, %lu hooks in %.0f ms", pass, count, (unsigned long)matched,
+    XNALog(@"pass %@: %u classes, %lu candidates, %lu hooks in %.0f ms", pass, count, (unsigned long)scanned,
            (unsigned long)XNAHookedCount, (NSProcessInfo.processInfo.systemUptime - started) * 1000);
     XNAFlushLog();
 }
@@ -216,8 +312,19 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
         XNALog(@"XrkNoAd attached to %@ / %@", NSProcessInfo.processInfo.processName,
                NSBundle.mainBundle.bundleIdentifier);
         XNAInstallAll(@"eager");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            XNAInstallAll(@"late");
-        });
+        // 广告视图类大多要等第一次请求广告时才注册，热启动那次也必须重新扫一遍。
+        for (NSNumber *delay in @[ @2, @5, @15, @40 ]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                               XNAInstallAll(@"late");
+                           });
+        }
+        id observer = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                                     object:nil
+                                                                        queue:NSOperationQueue.mainQueue
+                                                                   usingBlock:^(NSNotification *note) {
+                                                                       XNAInstallAll(@"active");
+                                                                   }];
+        XNAKeep(observer);
     }
 }
