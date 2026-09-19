@@ -401,38 +401,46 @@ static UIView *XNAOverlayShell(UIView *view) {
     }
 }
 
-// 页面骨架：rootViewController 那张脸和托着它的几层容器。掏空它等于把界面砸了，比留个弹窗严重得多。
-static BOOL XNAIsPageSkeleton(UIView *candidate) {
+// 只看普通层级的窗口：弹窗爱开在自己的浮窗里，那层窗口的 rootViewController.view 就是弹窗本身，
+// 把它当成「不许碰的页面」就等于自己把自己锁死。
+static NSArray<UIView *> *XNAPageRoots(void) {
+    NSMutableArray<UIView *> *roots = [NSMutableArray array];
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.windowLevel > 0.5 || window.windowLevel < -0.5) continue;
             UIView *root = window.rootViewController.viewIfLoaded;
-            if (!root) continue;
-            for (UIView *v = root; v; v = v.superview) {
-                if (v == candidate) return YES;
-            }
+            if (root) [roots addObject:root];
+        }
+    }
+    return roots;
+}
+
+static CGFloat XNAArea(CGRect rect) {
+    return CGRectGetWidth(rect) * CGRectGetHeight(rect);
+}
+
+// 页面骨架：rootViewController 那张脸和托着它的几层容器。掏空它等于把界面砸了，比留个弹窗严重得多。
+static BOOL XNAIsPageSkeleton(UIView *candidate) {
+    for (UIView *root in XNAPageRoots()) {
+        for (UIView *v = root; v; v = v.superview) {
+            if (v == candidate) return YES;
         }
     }
     return NO;
 }
 
-// 推广块是嵌在页面里还是浮在页面上：浮着的那层壳（弹窗的蒙层）整块端走，嵌着的只摘它自己。
+// 推广块是嵌在页面里还是浮在页面上：浮着的那层壳（连蒙层一起）整块端走，嵌着的只摘它自己。
 static BOOL XNAIsInsidePage(UIView *candidate) {
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            UIView *root = window.rootViewController.viewIfLoaded;
-            if (root && [candidate isDescendantOfView:root]) return YES;
-        }
+    for (UIView *root in XNAPageRoots()) {
+        if ([candidate isDescendantOfView:root]) return YES;
     }
     return NO;
 }
 
 static BOOL XNAIsOversized(UIView *view) {
     UIWindow *window = view.window;
-    if (!window) return NO;
-    return CGRectGetWidth(view.bounds) * CGRectGetHeight(view.bounds) >
-               0.75 * CGRectGetWidth(window.bounds) * CGRectGetHeight(window.bounds);
+    return window && XNAArea(view.bounds) > 0.75 * XNAArea(window.bounds);
 }
 
 // 盖满全屏、又长在页面里的那层不是弹窗壳，是页面本体。
@@ -441,8 +449,9 @@ static BOOL XNAIsPageBody(UIView *view) {
 }
 
 // 认不出类名的会员弹窗（「免费跨境节点繁忙」那种）只能看内容：同一棵子树里既长出「立即升级」
-// 又长出「再想想」，那就不是普通页面。返回 2 坐实，1 是只凑齐一半——按钮常常比容器晚一帧建出来。
+// 又长出「再想想」，那就不是普通页面。返回 2 坐实，1 是只凑齐一半。
 static NSInteger XNAIsPaywallDialog(UIView *root) {
+    if (!root) return 0;
     static const NSUInteger XNAMaxNodes = 150;
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root];
     BOOL hasReject = NO, hasUpsell = NO;
@@ -460,75 +469,111 @@ static NSInteger XNAIsPaywallDialog(UIView *root) {
     return hasReject || hasUpsell;
 }
 
-static NSMapTable<UIView *, NSNumber *> *XNAPaywallWatch(void) {
-    static NSMapTable *watch;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ watch = [NSMapTable weakToStrongObjectsMapTable]; });
-    return watch;
+// 壳常常是复用过的老视图，只有按钮是新长出来的，所以从按钮往上找壳，别等壳自己变「新鲜」。
+// 只爬 App 自己的视图：系统的转场/蒙层容器一路往上爬就到整个窗口了，那种不能碰。
+static UIView *XNAOverlayHostForLeaf(UIView *leaf) {
+    UIView *top = leaf;
+    for (;;) {
+        UIView *parent = top.superview;
+        if (!parent || [parent isKindOfClass:UIWindow.class]) break;
+        if (!XNAClassIsAppOwned(parent.class) || XNAIsPageBody(parent)) break;
+        top = parent;
+    }
+    return top == leaf ? nil : top;
 }
 
-// 命中到整页时往下找卡片：BFS 从外往里走，第一个「已经不是页面骨架、却又齐活」的那层就是弹窗本体。
-static UIView *XNAPaywallCard(UIView *root) {
+// 一行的两个按钮：「立即升级」旁边还站着一个键，就是弹窗的按钮行。
+// 「再想想」那半边常常读不出文字（CustomConfirmButton 读得到，对面那个读不到），
+// 光靠文案配对会漏，形状不会漏。
+static BOOL XNAIsButtonRowLeaf(UIView *leaf) {
+    UIView *parent = leaf.superview;
+    if (!parent) return NO;
+    NSUInteger controls = 0;
+    for (UIView *sibling in parent.subviews) {
+        if ([sibling isKindOfClass:UIControl.class] && !sibling.isHidden) controls++;
+    }
+    return controls >= 2;
+}
+
+static NSUInteger XNASubtreeSize(UIView *root) {
+    static const NSUInteger XNAMaxNodes = 24;
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root];
     NSUInteger visited = 0;
-    while (queue.count && visited < 150) {
+    while (queue.count && visited < XNAMaxNodes) {
         UIView *view = queue.firstObject;
         [queue removeObjectAtIndex:0];
         visited++;
-        if (!XNAIsPageBody(view) && XNAIsPaywallDialog(view) == 2) return view;
         [queue addObjectsFromArray:view.subviews];
     }
-    return nil;
+    return visited;
 }
 
-// 摘掉一块推广。先按它自带的关闭键，走 App 自己的关闭分支（蒙层跟着一起没，最干净）；
-// 像 VipRemindView 那种没有可点按钮的，再兜底把壳藏掉。
-// contentBased 是文案判据（认不出类名的那种）：它可能把用户自己点开的升级页也读成弹窗，
-// 所以这一路落在页面里时只按不摘。
-static void XNAKillOverlay(UIView *view, NSString *via, BOOL contentBased) {
-    UIView *target = XNAOverlayShell(view);
-    if (XNAIsPageBody(target)) {
-        UIView *card = XNAPaywallCard(target);
-        if (card && !XNAIsPageBody(card)) target = card;
+// 壳里铺满一层、底下还压着几十号视图的，是用户自己点开的整页，别连着页一起端掉。
+static BOOL XNAHostHoldsFullPage(UIView *host) {
+    for (UIView *child in host.subviews) {
+        if (child.isHidden) continue;
+        if (XNAArea(child.bounds) >= 0.9 * XNAArea(host.bounds) && XNASubtreeSize(child) >= 24) return YES;
     }
-    if (target.isHidden) return;
-    NSUInteger tapped = XNATrySkipInView(target, XNACloseWords());
-    if (XNAIsPageBody(target) || (contentBased && XNAIsInsidePage(target))) {
+    return NO;
+}
+
+// 居中的一张卡片：宽占屏 0.45~0.98、高占屏 0.12~0.85，中心落在屏幕中间那一带。
+// 底部横幅条（428×39 那种）和整页都不长这样，误伤面就靠这一点几何关系兜着。
+static BOOL XNAIsCenteredCard(UIView *host) {
+    UIWindow *window = host.window;
+    if (!window) return NO;
+    CGFloat w = CGRectGetWidth(window.bounds), h = CGRectGetHeight(window.bounds);
+    if (w < 1 || h < 1) return NO;
+    CGRect rect = [host convertRect:host.bounds toView:window];
+    CGFloat rw = CGRectGetWidth(rect) / w, rh = CGRectGetHeight(rect) / h;
+    if (rw < 0.45 || rw > 0.98 || rh < 0.12 || rh > 0.85) return NO;
+    CGFloat cx = CGRectGetMidX(rect) / w, cy = CGRectGetMidY(rect) / h;
+    return cx > 0.3 && cx < 0.7 && cy > 0.25 && cy < 0.75;
+}
+
+// 这些 nag 都是 present 出来的 ViewController（VipRemindView 的父链里就挂着 _UIParallaxDimmingView）。
+// 只摘视图会留下一层吃掉点击的蒙层，让 UIKit 自己收场才干净；不是最上面那层 present 就别按。
+static BOOL XNADismissPresentedHost(UIView *host, NSString *via) {
+    for (UIResponder *responder = host.nextResponder; responder; responder = responder.nextResponder) {
+        if (![responder isKindOfClass:UIViewController.class]) continue;
+        UIViewController *vc = (UIViewController *)responder;
+        if (vc.view != host) return NO;
+        UIViewController *presenter = vc.presentingViewController;
+        if (!presenter || presenter.presentedViewController != vc) return NO;
+        [vc dismissViewControllerAnimated:NO completion:nil];
+        XNALog(@"overlay-dismiss %@ via %@", NSStringFromClass(vc.class), via);
+        return YES;
+    }
+    return NO;
+}
+
+// 摘掉一块推广，host 就是它的壳。先按壳自带的关闭键，走 App 自己的关闭分支（蒙层跟着一起没，最干净）；
+// 像 VipRemindView 那种根本没有可点按钮的，再兜底把壳藏掉。
+static void XNAKillHost(UIView *host, NSString *via) {
+    if (!host || host.isHidden || [host isKindOfClass:UIWindow.class]) return;
+    NSUInteger tapped = XNATrySkipInView(host, XNACloseWords());
+    if (XNAIsPageBody(host)) {
         // 摘不动就只留那一按：宁可弹窗挂着，也不能把界面掏空。
-        XNALog(@"overlay-keep %@ via %@ close=%lu", NSStringFromClass(target.class), via, (unsigned long)tapped);
+        XNALog(@"overlay-keep %@ via %@ close=%lu", NSStringFromClass(host.class), via, (unsigned long)tapped);
         return;
     }
     // 父视图链要留着：谁把这块气泡加进界面的，下一版就挂谁的 layoutSubviews，
     // 省得靠轮询，也就没有那零点几秒的闪现。
     NSMutableString *chain = [NSMutableString string];
-    for (UIView *parent = target.superview; parent && chain.length < 60; parent = parent.superview) {
+    for (UIView *parent = host.superview; parent && chain.length < 60; parent = parent.superview) {
         [chain appendFormat:@" <- %@(%.0fx%.0f)", NSStringFromClass(parent.class),
                             CGRectGetWidth(parent.bounds), CGRectGetHeight(parent.bounds)];
     }
-    target.hidden = YES;
-    target.alpha = 0;
-    [target removeFromSuperview];
-    XNALog(@"overlay-hide %@ via %@ close=%lu%@", NSStringFromClass(target.class), via,
-           (unsigned long)tapped, chain);
+    host.hidden = YES;
+    host.alpha = 0;
+    [host removeFromSuperview];
+    XNALog(@"overlay-hide %@ via %@ frame=%@ close=%lu%@", NSStringFromClass(host.class), via,
+           NSStringFromCGRect(host.frame), (unsigned long)tapped, chain);
 }
 
-static void XNAWatchPaywall(UIView *view) {
-    NSUInteger tries = [[XNAPaywallWatch() objectForKey:view] unsignedIntegerValue];
-    if (tries < 12) [XNAPaywallWatch() setObject:@(tries + 1) forKey:view];
-}
-
-static void XNARecheckPaywalls(void) {
-    for (UIView *view in XNAPaywallWatch().keyEnumerator.allObjects) {
-        NSNumber *tries = [XNAPaywallWatch() objectForKey:view];
-        if (!view.window || view.isHidden) {
-            [XNAPaywallWatch() removeObjectForKey:view];
-        } else if (XNAIsPaywallDialog(view) == 2) {
-            [XNAPaywallWatch() removeObjectForKey:view];
-            XNAKillOverlay(view, @"paywall", YES);
-        } else if (tries.unsignedIntegerValue >= 12) {
-            [XNAPaywallWatch() removeObjectForKey:view];
-        }
-    }
+// 按类名认出来的那批（VipRemindView 一类）：壳还得靠紧贴关系往上套一层。
+static void XNAKillOverlay(UIView *view, NSString *via) {
+    XNAKillHost(XNAOverlayShell(view), via);
 }
 
 static void XNAScanOverlays(void) {
@@ -560,30 +605,37 @@ static void XNAScanOverlays(void) {
         if (!XNAClassIsAppOwned(view.class)) continue;
         NSString *className = NSStringFromClass(view.class);
         if (XNAIsPromotionOverlay(className)) {
-            if (view.window && !view.isHidden) XNAKillOverlay(view, className, NO);
+            if (view.window && !view.isHidden) XNAKillOverlay(view, className);
             continue;
         }
         BOOL fresh = ![XNASeenViews() containsObject:view];
         [XNASeenViews() addObject:view];
         if (!fresh || !report) continue;
         if (view.isHidden || view.alpha < 0.05 || !view.window) continue;
-        if (level <= 6) {
-            NSInteger verdict = XNAIsPaywallDialog(view);
-            if (verdict == 2) XNAKillOverlay(view, @"paywall", YES);
-            else if (verdict == 1) XNAWatchPaywall(view);
-        }
-        // 直接挂在窗口上的新视图一律记（弹窗都这么干）；藏在页面深处的只记名字像推广的。
         NSString *text = XNAViewText(view);
-        if (XNAMatchText(text, XNAUpsellWords())) {
+        if ([view isKindOfClass:UIControl.class] && XNAMatchText(text, XNAUpsellWords())) {
+            // 认得出「立即升级」就先把壳的形状记下来：这一路是猜的，错了要靠日志纠。
             XNALog(@"overlay-text %@ d=%lu frame=%@ text=%@", className, (unsigned long)level,
                    NSStringFromCGRect(view.frame), text);
+            UIView *host = XNAOverlayHostForLeaf(view);
+            BOOL pair = XNAIsPaywallDialog(host) == 2;
+            if (host && !XNAHostHoldsFullPage(host) &&
+                (pair || (!XNAIsInsidePage(host) && XNAIsButtonRowLeaf(view)))) {
+                if (!XNADismissPresentedHost(host, @"upsell")) {
+                    if (XNAIsCenteredCard(host)) XNAKillHost(host, @"upsell");
+                    else XNALog(@"overlay-miss %@ via upsell frame=%@", NSStringFromClass(host.class),
+                                NSStringFromCGRect(host.frame));
+                }
+            }
+        } else if (level <= 6 && XNAIsPaywallDialog(view) == 2) {
+            XNAKillOverlay(view, @"paywall");
         } else if ([view.superview isKindOfClass:UIWindow.class] || level <= 3 ||
                    XNALooksLikeOverlayHost(className)) {
+            // 直接挂在窗口上的新视图一律记（弹窗都这么干）；藏在页面深处的只记名字像推广的。
             XNALog(@"overlay %@ d=%lu frame=%@ text=%@", className, (unsigned long)level,
                    NSStringFromCGRect(view.frame), text ?: @"-");
         }
     }
-    XNARecheckPaywalls();
     // 只在真的写了东西时刷盘：这一秒一秒地跑，每次都重写整份日志太浪费。
     BOOL wrote;
     @synchronized(XNAJournal()) { wrote = XNAJournal().count != logged; }
