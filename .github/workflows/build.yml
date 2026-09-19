@@ -41,7 +41,27 @@ jobs:
       - name: Verify standalone dylib and package
         run: |
           python3 - <<'PY'
-          import pathlib, struct, subprocess
+          import gzip
+          import lzma
+          import pathlib
+          import re
+          import struct
+          import subprocess
+
+          def read_control(deb_path):
+              data = deb_path.read_bytes()
+              assert data[:8] == b'!<arch>\n', 'expected an ar archive'
+              pos, tail = 8, len(data) - 60
+              while pos <= tail:
+                  name = data[pos:pos + 16].decode().rstrip()
+                  size = int(data[pos + 48:pos + 58].decode())
+                  if name.startswith('control'):
+                      body = data[pos + 60:pos + 60 + size]
+                      raw = gzip.decompress(body) if body[:2] == b'\x1f\x8b' else lzma.decompress(body)
+                      return raw.decode(errors='replace')
+                  pos += 60 + size + (size & 1)
+              raise AssertionError('no control member in deb')
+
           dylib = next(pathlib.Path('.theos/obj').rglob('XrkNoAd.dylib'))
           magic, cpu, subtype = struct.unpack_from('<III', dylib.read_bytes())
           assert magic == 0xfeedfacf and cpu == 0x100000c, 'expected thin ARM64 Mach-O'
@@ -54,6 +74,13 @@ jobs:
           print(names)
           packages = list(pathlib.Path('packages').glob('*.deb'))
           assert len(packages) == 1, f'expected one deb, got {len(packages)}'
+          control = read_control(packages[0])
+          # iphoneos-arm64e 是 roothide 的包架构标签（theos 在 vendor/mod/roothide/package/deb.mk 里强制），
+          # 与 dylib 的实际 ABI 无关：宿主 App 是纯 arm64，所以二进制必须是 plain arm64。
+          arch = re.search(r'^Architecture: (.+)$', control, re.M).group(1).strip()
+          assert arch == 'iphoneos-arm64e', f'expected roothide package label, got {arch}'
+          assert re.search(r'^Depends: .*mobilesubstrate', control, re.M), control
+          assert packages[0].name.endswith('_iphoneos-arm64e.deb'), packages[0].name
           print('built', packages[0], dylib)
           PY
           find .theos/_ -type f | grep -E 'XrkNoAd\.dylib|XrkNoAd\.plist'
