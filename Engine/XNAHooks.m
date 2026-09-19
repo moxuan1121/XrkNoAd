@@ -391,10 +391,18 @@ static void XNAHidePromotionOverlay(UIView *view, NSString *className) {
         return;
     }
     NSUInteger tapped = XNATrySkipInView(shell, XNACloseWords());
+    // 父视图链要留着：谁把这块气泡加进界面的，下一版就挂谁的 layoutSubviews，
+    // 省得靠轮询，也就没有那零点几秒的闪现。
+    NSMutableString *chain = [NSMutableString string];
+    for (UIView *parent = shell.superview; parent && chain.length < 60; parent = parent.superview) {
+        [chain appendFormat:@" <- %@(%.0fx%.0f)", NSStringFromClass(parent.class),
+                            CGRectGetWidth(parent.bounds), CGRectGetHeight(parent.bounds)];
+    }
     shell.hidden = YES;
     shell.alpha = 0;
     [shell removeFromSuperview];
-    XNALog(@"overlay-hide %@ via %@ close=%lu", NSStringFromClass(shell.class), className, (unsigned long)tapped);
+    XNALog(@"overlay-hide %@ via %@ close=%lu%@", NSStringFromClass(shell.class), className,
+           (unsigned long)tapped, chain);
 }
 
 static void XNAScanOverlays(void) {
@@ -482,10 +490,13 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
         XNALog(@"XrkNoAd attached to %@ / %@", NSProcessInfo.processInfo.processName,
                NSBundle.mainBundle.bundleIdentifier);
         XNAInstallAll(@"launch", YES);
-        // 先认出来才能屏蔽：主线程每半秒扫一遍界面层，记新出现的 App 自有视图、藏掉会员推广弹窗。
-        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        // 先认出来才能屏蔽：主线程扫界面层，记新出现的 App 自有视图、藏掉会员推广弹窗。
+        // 挂到 common modes，否则滚动和手势期间根本不扫，弹窗会一直挂着。
+        NSTimer *probe = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
             XNAScanOverlays();
         }];
+        [NSRunLoop.mainRunLoop addTimer:probe forMode:NSRunLoopCommonModes];
+        XNAKeep(probe);
         // 广告视图类大多要等第一次请求广告时才注册，所以要反复补扫；热启动回前台同理。
         for (NSNumber *delay in @[ @0.2, @2, @5, @15, @(XNAStartupWindow - 5) ]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
