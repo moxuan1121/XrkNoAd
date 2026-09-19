@@ -17,7 +17,8 @@ int main(void) {
         CHECK(XNAMatchGlob("GDTSplashAd", "GDT*"));
         CHECK(!XNAMatchGlob("DownloadViewController", "AD*"));
         CHECK(!XNAMatchGlob("AddressBookViewController", "*Ad"));
-        CHECK(!XNAMatchGlob("oad", "*ad"));
+        CHECK(!XNAMatchGlob("oad", "*AD"));
+        CHECK(XNAMatchGlob("BUSplashAd", "AT*Ad*|BU*|CSJ*"));
 
         const char *const adClasses[] = {
             "ATAdManager", "ATInitModule", "ATBanner", "ATInterstitial", "ATSplashManager", "ATSplash",

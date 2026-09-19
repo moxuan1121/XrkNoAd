@@ -2,26 +2,6 @@
 #import <objc/runtime.h>
 #import <string.h>
 
-BOOL XNAMatchGlob(const char *name, const char *pattern) {
-    if (!name || !pattern) return NO;
-    while (*pattern) {
-        if (*pattern == '|') return XNAMatchGlob(name, pattern + 1);
-        if (*pattern == '*') {
-            pattern++;
-            if (!*pattern || *pattern == '|') return YES;
-            for (const char *p = name; ; p++) {
-                if (XNAMatchGlob(p, pattern)) return YES;
-                if (!*p) return NO;
-            }
-        }
-        if (!*name) return NO;
-        if (*pattern != '?' && *pattern != *name) return NO;
-        name++;
-        pattern++;
-    }
-    return *name == '\0';
-}
-
 typedef struct {
     const char *classes;
     const char *selectors;

@@ -2,6 +2,7 @@
 #define XNAPATTERN_H
 
 #import <Foundation/Foundation.h>
+#import "XNAGlob.h"
 
 typedef NS_ENUM(NSUInteger, XNAAction) {
     XNAActionNone = 0,
@@ -9,9 +10,6 @@ typedef NS_ENUM(NSUInteger, XNAAction) {
     XNAActionStubData,
     XNAActionDefuse,
 };
-
-// 大小写敏感的 glob：支持 '*'、'?'，用 '|' 连接多个候选。
-BOOL XNAMatchGlob(const char *name, const char *pattern);
 
 // 类名是否可能承载广告逻辑，用于扫描时跳过绝大多数无关类。
 BOOL XNAIsInterestingClassName(const char *name);

@@ -14,10 +14,14 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
+      - name: Check glob matcher
+        run: |
+          clang -Wall -Wextra -Werror -std=c11 -I Engine Tests/test_glob.c Engine/XNAGlob.c -o /tmp/xrknoad-glob
+          /tmp/xrknoad-glob
       - name: Check ad hook patterns
         run: |
           clang -fobjc-arc -Wall -Wextra -Wno-unused-parameter -I Engine -framework Foundation \
-            Tests/test_pattern.m Engine/XNAPattern.m -o /tmp/xrknoad-pattern
+            Tests/test_pattern.m Engine/XNAPattern.m Engine/XNAGlob.c -o /tmp/xrknoad-pattern
           /tmp/xrknoad-pattern
       - name: Install signing tools
         run: brew install ldid xz
