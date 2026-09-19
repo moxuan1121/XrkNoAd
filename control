@@ -1,0 +1,9 @@
+Package: com.moxuan.xrknoad
+Name: XrkNoAd
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: 屏蔽向日葵远程控制 iOS 端广告展示（开屏、插屏、信息流、激励入口）。
+Maintainer: moxuan
+Author: moxuan
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 13.0)
