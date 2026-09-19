@@ -257,12 +257,27 @@ static BOOL XNAClassIsAppOwned(Class cls) {
     return image && strstr(image, ".app/");
 }
 
+// 标量返回且不吃参数，就是个取值器：showTime / render_delay_time / showVideoDetail 这类。
+// 真把展示方法挂上去要付每次读取的代价，而这类 getter 在信息流列表里每秒被调几百次。
+static BOOL XNAIsAccessorShaped(const char *encoding, unsigned int argumentCount) {
+    if (argumentCount != 2) return NO;
+    switch (encoding[0]) {
+        case 'v': case '@': case '#': case '*': case '^':
+            return NO;
+        default:
+            return YES;
+    }
+}
+
 static void XNAHookMethod(Class cls, Method method, BOOL isClassMethod) {
     SEL selector = method_getName(method);
     char returnType = 'v';
-    if (!XNASignaturePortable(method_getTypeEncoding(method), &returnType)) return;
+    const char *encoding = method_getTypeEncoding(method);
+    if (!XNASignaturePortable(encoding, &returnType)) return;
+    unsigned int argumentCount = method_getNumberOfArguments(method);
     // 转发垫片只带 3 个指针参数，self/_cmd 之外更多参数的方法一律不动。
-    if (method_getNumberOfArguments(method) > 5) return;
+    if (argumentCount > 5) return;
+    if (XNAIsAccessorShaped(encoding, argumentCount)) return;
     IMP original = method_getImplementation(method);
     IMP replacement = XNADefuseIMP(original, returnType);
     if (!replacement || original == replacement) return;
@@ -331,6 +346,9 @@ static void XNAInstallAll(NSString *pass, BOOL launchOnly) {
     XNAFlushLog();
 }
 
+// 启动窗口：这之前的补扫全部交给下面的定时任务，最后一次落在 40 s。
+static const NSTimeInterval XNAStartupWindow = 45;
+
 __attribute__((constructor)) static void XrkNoAdEntry(void) {
     @autoreleasepool {
         XNALaunchUptime = NSProcessInfo.processInfo.systemUptime;
@@ -338,7 +356,7 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
                NSBundle.mainBundle.bundleIdentifier);
         XNAInstallAll(@"launch", YES);
         // 广告视图类大多要等第一次请求广告时才注册，所以要反复补扫；热启动回前台同理。
-        for (NSNumber *delay in @[ @0.2, @2, @5, @15, @40 ]) {
+        for (NSNumber *delay in @[ @0.2, @2, @5, @15, @(XNAStartupWindow - 5) ]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                            XNAInstallQueue(), ^{
                                XNAInstallAll(@"full", NO);
@@ -348,6 +366,16 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
                                                                      object:nil
                                                                         queue:nil
                                                                    usingBlock:^(NSNotification *note) {
+                                                                       // 冷启动那次 DidBecomeActive 和上面的定时补扫是同一件事，
+                                                                       // 抢在启动窗口里再全量扫一遍只是白占后台 CPU。
+                                                                       NSTimeInterval age =
+                                                                           NSProcessInfo.processInfo.systemUptime - XNALaunchUptime;
+                                                                       if (age < XNAStartupWindow) {
+                                                                           XNALog(@"skip active pass at +%0.0fs (startup window)", age);
+                                                                           // 这条之后没有 pass 会再刷盘，不主动 flush 就等于没写。
+                                                                           XNAFlushLog();
+                                                                           return;
+                                                                       }
                                                                        dispatch_async(XNAInstallQueue(), ^{
                                                                            XNAInstallAll(@"active", NO);
                                                                        });
