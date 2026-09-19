@@ -344,8 +344,9 @@ static void XNAScanOverlays(void) {
     BOOL report = baselined;
     baselined = YES;
     NSMutableArray<UIView *> *queue = [NSMutableArray array];
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
-        if (window) [queue addObject:window];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        [queue addObjectsFromArray:((UIWindowScene *)scene).windows];
     }
     NSUInteger visited = 0;
     while (queue.count && visited < 900) {
@@ -362,7 +363,7 @@ static void XNAScanOverlays(void) {
         // 直接挂在窗口上的新视图一律记（弹窗都这么干）；藏在页面深处的只记名字像推广的。
         if (![view.superview isKindOfClass:UIWindow.class] && !XNALooksLikeOverlayHost(className)) continue;
         NSString *text = XNAViewText(view);
-        XNALog(@"overlay %@ frame=%@ text=%@", className, NSStringFromRect(view.frame), text ?: @"-");
+        XNALog(@"overlay %@ frame=%@ text=%@", className, NSStringFromCGRect(view.frame), text ?: @"-");
     }
     if (report) XNAFlushLog();
 }
