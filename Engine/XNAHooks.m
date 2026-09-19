@@ -65,12 +65,10 @@ static NSUInteger XNAActionCount = 0;
 
 #pragma mark - skip button
 
-// 只认「跳过」：这类按钮按下后广告会走自己的关闭分支，宿主 App 拿得到回调。
+// 广告只认「跳过」：按下后广告会走自己的关闭分支，宿主 App 拿得到回调。
 // 「关闭」一类的不点——它可能属于业务弹窗，而且误触广告比广告本身更糟。
-static BOOL XNAMatchSkipText(NSString *text) {
-    static NSArray<NSString *> *keywords;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ keywords = @[ @"跳过", @"skip" ]; });
+// 会员推广那条路径是另一套词表，见 XNACloseWords。
+static BOOL XNAMatchText(NSString *text, NSArray<NSString *> *keywords) {
     if (text.length == 0) return NO;
     NSString *lower = text.lowercaseString;
     for (NSString *keyword in keywords) {
@@ -79,17 +77,32 @@ static BOOL XNAMatchSkipText(NSString *text) {
     return NO;
 }
 
-static BOOL XNALooksLikeSkip(UIControl *control) {
+static NSArray<NSString *> *XNASkipWords(void) {
+    static NSArray<NSString *> *words;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ words = @[ @"跳过", @"skip" ]; });
+    return words;
+}
+
+// 推广弹窗是自己人（App 的会员提示），关掉它的 ✕ 没有误触广告的风险，反而比硬摘视图干净。
+static NSArray<NSString *> *XNACloseWords(void) {
+    static NSArray<NSString *> *words;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ words = @[ @"跳过", @"skip", @"关闭", @"close", @"dismiss" ]; });
+    return words;
+}
+
+static BOOL XNALooksLikeSkip(UIControl *control, NSArray<NSString *> *keywords) {
     if ([control isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)control;
-        if (XNAMatchSkipText(button.currentTitle) || XNAMatchSkipText(button.currentAttributedTitle.string)) return YES;
+        if (XNAMatchText(button.currentTitle, keywords) || XNAMatchText(button.currentAttributedTitle.string, keywords)) return YES;
     }
     if (control.allTargets.count == 0) return NO;
-    return XNAMatchSkipText(control.accessibilityLabel) || XNAMatchSkipText(control.accessibilityValue);
+    return XNAMatchText(control.accessibilityLabel, keywords) || XNAMatchText(control.accessibilityValue, keywords);
 }
 
 // 广度优先找广告自带的跳过按钮，限定在这块广告视图内部，避免点到业务界面的同名按钮。
-static NSUInteger XNATrySkipInView(UIView *root) {
+static NSUInteger XNATrySkipInView(UIView *root, NSArray<NSString *> *keywords) {
     static const NSUInteger XNAMaxNodes = 400;
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root];
     NSUInteger tapped = 0, visited = 0;
@@ -97,7 +110,7 @@ static NSUInteger XNATrySkipInView(UIView *root) {
         UIView *view = queue.firstObject;
         [queue removeObjectAtIndex:0];
         visited++;
-        if (view != root && [view isKindOfClass:UIControl.class] && XNALooksLikeSkip((UIControl *)view)) {
+        if (view != root && [view isKindOfClass:UIControl.class] && XNALooksLikeSkip((UIControl *)view, keywords)) {
             [(UIControl *)view sendActionsForControlEvents:UIControlEventTouchUpInside];
             tapped++;
             continue;
@@ -122,7 +135,7 @@ static void XNASkipIfNeeded(UIView *view, NSString *className) {
     if ([state[0] integerValue] >= XNAMaxSkipAttempts || now - [state[1] doubleValue] < 0.5) return;
     state[0] = @([state[0] integerValue] + 1);
     state[1] = @(now);
-    NSUInteger tapped = XNATrySkipInView(view);
+    NSUInteger tapped = XNATrySkipInView(view, XNASkipWords());
     if (tapped) {
         state[0] = @(XNAMaxSkipAttempts);
         XNALog(@"skip-button %@ x%lu", className, (unsigned long)tapped);
@@ -339,10 +352,57 @@ static NSString *XNAViewText(UIView *view) {
     return nil;
 }
 
+// 实机日志点名出来的会员推广宿主（VipRemindView 底部横幅、CommonRemindView/ToastTextView 居中气泡）。
+// 这几个类在二进制里自己一个方法都没实现，没有可挂的钩子，只能靠这里按名字认出来再藏。
+static BOOL XNAIsPromotionOverlay(NSString *className) {
+    static NSArray<NSString *> *prefixes;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        prefixes = @[ @"VipRemind", @"CommonRemind", @"ToastText", @"RCVipPrompt" ];
+    });
+    for (NSString *prefix in prefixes) {
+        if ([className hasPrefix:prefix]) return YES;
+    }
+    return NO;
+}
+
+// 气泡里的文字单独藏掉只会留下一个空壳，所以父视图只要还紧贴着这块内容，就继续往上套一层。
+static UIView *XNAOverlayShell(UIView *view) {
+    UIView *top = view;
+    for (;;) {
+        UIView *parent = top.superview;
+        if (!parent || [parent isKindOfClass:UIWindow.class]) return top;
+        if (!XNAClassIsAppOwned(parent.class)) return top;
+        if (CGRectGetWidth(parent.bounds) > CGRectGetWidth(top.bounds) * 2.5 ||
+            CGRectGetHeight(parent.bounds) > CGRectGetHeight(top.bounds) * 2.5)
+            return top;
+        top = parent;
+    }
+}
+
+static void XNAHidePromotionOverlay(UIView *view, NSString *className) {
+    UIView *shell = XNAOverlayShell(view);
+    if (shell.isHidden) return;
+    UIWindow *window = shell.window;
+    // 盖掉大半个屏幕的不是推广条，多半是页面本体，宁可留着也别把界面掏空。
+    if (window && CGRectGetWidth(shell.bounds) * CGRectGetHeight(shell.bounds) >
+                      0.6 * CGRectGetWidth(window.bounds) * CGRectGetHeight(window.bounds)) {
+        XNALog(@"overlay-keep %@ via %@", NSStringFromClass(shell.class), className);
+        return;
+    }
+    NSUInteger tapped = XNATrySkipInView(shell, XNACloseWords());
+    shell.hidden = YES;
+    shell.alpha = 0;
+    [shell removeFromSuperview];
+    XNALog(@"overlay-hide %@ via %@ close=%lu", NSStringFromClass(shell.class), className, (unsigned long)tapped);
+}
+
 static void XNAScanOverlays(void) {
     static BOOL baselined = NO;
     BOOL report = baselined;
     baselined = YES;
+    NSUInteger logged;
+    @synchronized(XNAJournal()) { logged = XNAJournal().count; }
     NSMutableArray<UIView *> *queue = [NSMutableArray array];
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
@@ -354,18 +414,25 @@ static void XNAScanOverlays(void) {
         [queue removeObjectAtIndex:0];
         visited++;
         [queue addObjectsFromArray:view.subviews];
+        if (!XNAClassIsAppOwned(view.class)) continue;
+        NSString *className = NSStringFromClass(view.class);
+        if (XNAIsPromotionOverlay(className)) {
+            if (view.window && !view.isHidden) XNAHidePromotionOverlay(view, className);
+            continue;
+        }
         BOOL fresh = ![XNASeenViews() containsObject:view];
         [XNASeenViews() addObject:view];
         if (!fresh || !report) continue;
         if (view.isHidden || view.alpha < 0.05 || !view.window) continue;
-        if (!XNAClassIsAppOwned(view.class)) continue;
-        NSString *className = NSStringFromClass(view.class);
         // 直接挂在窗口上的新视图一律记（弹窗都这么干）；藏在页面深处的只记名字像推广的。
         if (![view.superview isKindOfClass:UIWindow.class] && !XNALooksLikeOverlayHost(className)) continue;
         NSString *text = XNAViewText(view);
         XNALog(@"overlay %@ frame=%@ text=%@", className, NSStringFromCGRect(view.frame), text ?: @"-");
     }
-    if (report) XNAFlushLog();
+    // 只在真的写了东西时刷盘：这一秒一秒地跑，每次都重写整份日志太浪费。
+    BOOL wrote;
+    @synchronized(XNAJournal()) { wrote = XNAJournal().count != logged; }
+    if (wrote) XNAFlushLog();
 }
 
 // 扫描全在一条自己的串行队列上做，主线程只负责开屏那一批。
@@ -415,8 +482,8 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
         XNALog(@"XrkNoAd attached to %@ / %@", NSProcessInfo.processInfo.processName,
                NSBundle.mainBundle.bundleIdentifier);
         XNAInstallAll(@"launch", YES);
-        // 先认出来才能屏蔽：主线程每秒扫一遍界面层，把新出现的 App 自有视图记进日志。
-        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+        // 先认出来才能屏蔽：主线程每半秒扫一遍界面层，记新出现的 App 自有视图、藏掉会员推广弹窗。
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
             XNAScanOverlays();
         }];
         // 广告视图类大多要等第一次请求广告时才注册，所以要反复补扫；热启动回前台同理。

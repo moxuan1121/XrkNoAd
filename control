@@ -1,6 +1,6 @@
 Package: com.moxuan.xrknoad
 Name: XrkNoAd
-Version: 0.0.5
+Version: 0.0.6
 Architecture: iphoneos-arm64e
 Description: 屏蔽向日葵远程控制 iOS 端广告展示（开屏、插屏、信息流、激励入口）。
 Maintainer: moxuan
