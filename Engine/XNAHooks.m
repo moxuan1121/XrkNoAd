@@ -268,6 +268,207 @@ static IMP XNADefuseIMP(IMP original, char returnType) {
     }
 }
 
+#pragma mark - membership alert muting
+
+// 会员弹窗的文案是服务端下发的，二进制里一个字都搜不到，类名规则永远点不到它。但它要走界面，
+// 总得把文案原样传进 App 自己的弹窗助手——所以在「要弹」这一刻掐掉是可行的，比视图层轮询干净：
+// 没有 0.25 秒的闪现，也不会出现摘了卡片留下蒙层的残局。
+// 词表刻意不收「升级」：固件强更那一类也喊升级，那是业务，不能吞。
+static NSArray<NSString *> *XNAMemberWords(void) {
+    static NSArray<NSString *> *words;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ words = @[ @"会员", @"专享", @"专属", @"独享", @"vip" ]; });
+    return words;
+}
+
+// 参数按 void * 收，取用时才桥成对象——和 XNADefuseIMP 一样，免得 ARC 去 retain 一个栈上 block。
+static NSString *XNAMembershipCopy(void *arg) {
+    if (!arg) return nil;
+    id value = (__bridge id)arg;
+    NSString *text = nil;
+    if ([value isKindOfClass:NSString.class]) {
+        text = value;
+    } else if ([value isKindOfClass:NSAttributedString.class]) {
+        text = [(NSAttributedString *)value string];
+    }
+    if (text.length == 0 || !XNAMatchText(text, XNAMemberWords())) return nil;
+    return text;
+}
+
+// 命中就记一行原文：这批日志是判断「这个弹窗到底走哪条路」的唯一证据，别只留个 bool。
+// 没命中也要记一行调用本身——只有对着时间戳看，才知道那个大弹窗是不是真走这条路，
+// 也才知道钩子挂上了没有。这里不回显业务文案，宿主密码提示那类会把秘密写进日志。
+static BOOL XNAIsMembershipAlert(NSString *via, void **args, NSUInteger count) {
+    XNALog(@"alert-call %@", via);
+    for (NSUInteger i = 0; i < count; i++) {
+        NSString *text = XNAMembershipCopy(args[i]);
+        if (!text) continue;
+        NSString *clip = text.length > 40 ? [text substringToIndex:40] : text;
+        XNALog(@"alert-mute %@ text=%@", via, clip);
+        return YES;
+    }
+    return NO;
+}
+
+// 工厂已经造好了视图，只能就地做成看不见：从父视图里摘掉会在宿主那一格留个空洞。
+static void XNAHideBuiltView(void *arg) {
+    if (!arg) return;
+    id value = (__bridge id)arg;
+    if (![value isKindOfClass:UIView.class]) return;
+    UIView *view = value;
+    view.hidden = YES;
+    view.alpha = 0;
+}
+
+// 原 IMP 存文件作用域的静态量：block 捕获静态变量是按地址取的，捕获局部变量的话，
+// block 建出来那一刻局部量还没写进去，转发时就是调空指针。
+static IMP XNAAlertPlain = NULL;
+static IMP XNAAlertHeight = NULL;
+static IMP XNAAlertSolt = NULL;
+static IMP XNAAlertAttributed = NULL;
+static IMP XNARCFreePrompt = NULL;
+static IMP XNARCVipPrompt = NULL;
+
+static void XNAMuteEntry(Class cls, SEL selector, const char *encoding, IMP replacement, IMP *slot) {
+    if (!replacement || *slot) return;
+    for (BOOL classMethod = NO;; classMethod = YES) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(classMethod ? object_getClass(cls) : cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            if (method_getName(methods[i]) != selector) continue;
+            // 签名对不上就一动不动：App 改了参数，硬编下去等于用错的调用约定去调它，崩在弹窗里。
+            if (strcmp(method_getTypeEncoding(methods[i]), encoding) != 0) {
+                XNALog(@"alert-skip %s 签名已变：%s", sel_getName(selector),
+                       method_getTypeEncoding(methods[i]));
+                break;
+            }
+            *slot = method_getImplementation(methods[i]);
+            method_setImplementation(methods[i], replacement);
+            XNALog(@"alert-hook %@%s", classMethod ? @"+[" : @"-[", sel_getName(selector));
+            break;
+        }
+        free(methods);
+        if (classMethod) break;
+    }
+}
+
+static void XNAMuteMembershipAlerts(void) {
+    Class cls = objc_getClass("CustomAlertViewController");
+    if (cls) {
+        void (^plain)(id, SEL, void *, void *, void *, void *, void *, void *) =
+            ^(id self_, SEL _cmd, void *vc, void *title, void *message, void *ok, void *cancel,
+              void *done) {
+                void *args[] = { title, message, ok, cancel };
+                if (XNAIsMembershipAlert(@"plain", args, 4)) return;
+                if (XNAAlertPlain) {
+                    ((void (*)(id, SEL, void *, void *, void *, void *, void *, void *))
+                         XNAAlertPlain)(self_, _cmd, vc, title, message, ok, cancel, done);
+                }
+            };
+        XNAKeep(plain);
+        XNAMuteEntry(cls,
+                     NSSelectorFromString(
+                         @"showAlertViewWithViewController:title:textViewMessage:btnOKTitle:"
+                         @"btnCancelTitle:completion:"),
+                     "v64@0:8@16@24@32@40@48@?56", imp_implementationWithBlock(plain),
+                     &XNAAlertPlain);
+
+        void (^height)(id, SEL, void *, double, void *, void *, void *, void *, void *) =
+            ^(id self_, SEL _cmd, void *vc, double popupHeight, void *title, void *message,
+              void *ok, void *cancel, void *done) {
+                void *args[] = { title, message, ok, cancel };
+                if (XNAIsMembershipAlert(@"height", args, 4)) return;
+                if (XNAAlertHeight) {
+                    ((void (*)(id, SEL, void *, double, void *, void *, void *, void *, void *))
+                         XNAAlertHeight)(self_, _cmd, vc, popupHeight, title, message, ok, cancel,
+                                         done);
+                }
+            };
+        XNAKeep(height);
+        XNAMuteEntry(cls,
+                     NSSelectorFromString(
+                         @"showAlertViewWithViewController:popupHeight:title:textViewMessage:"
+                         @"btnOKTitle:btnCancelTitle:completion:"),
+                     "v72@0:8@16d24@32@40@48@56@?64", imp_implementationWithBlock(height),
+                     &XNAAlertHeight);
+
+        void (^solt)(id, SEL, void *, void *, double, void *, void *, void *, void *, void *) =
+            ^(id self_, SEL _cmd, void *vc, void *soltView, double popupHeight, void *title,
+              void *message, void *ok, void *cancel, void *done) {
+                void *args[] = { title, message, ok, cancel };
+                if (XNAIsMembershipAlert(@"solt", args, 4)) return;
+                if (XNAAlertSolt) {
+                    ((void (*)(id, SEL, void *, void *, double, void *, void *, void *, void *,
+                               void *))XNAAlertSolt)(self_, _cmd, vc, soltView, popupHeight, title,
+                                                     message, ok, cancel, done);
+                }
+            };
+        XNAKeep(solt);
+        XNAMuteEntry(cls,
+                     NSSelectorFromString(
+                         @"showAlertViewWithViewController:soltView:popupHeight:title:"
+                         @"textViewMessage:btnOKTitle:btnCancelTitle:completion:"),
+                     "v80@0:8@16@24d32@40@48@56@64@?72", imp_implementationWithBlock(solt),
+                     &XNAAlertSolt);
+
+        void (^attributed)(id, SEL, void *, double, void *, void *, void *, void *, BOOL,
+                           void *) =
+            ^(id self_, SEL _cmd, void *vc, double popupHeight, void *title, void *text, void *ok,
+              void *cancel, BOOL canNotClose, void *done) {
+                void *args[] = { title, text, ok, cancel };
+                if (XNAIsMembershipAlert(@"attributed", args, 4)) return;
+                if (XNAAlertAttributed) {
+                    ((void (*)(id, SEL, void *, double, void *, void *, void *, void *, BOOL,
+                               void *))XNAAlertAttributed)(self_, _cmd, vc, popupHeight, title,
+                                                          text, ok, cancel, canNotClose, done);
+                }
+            };
+        XNAKeep(attributed);
+        XNAMuteEntry(cls,
+                     NSSelectorFromString(
+                         @"showAlertViewWithViewController:popupHeight:title:attributedText:"
+                         @"btnOKTitle:btnCancelTitle:canNotClose:completion:"),
+                     "v76@0:8@16d24@32@40@48@56B64@?68",
+                     imp_implementationWithBlock(attributed), &XNAAlertAttributed);
+    }
+
+    // 这两个是「造一个推广气泡出来给宿主加进去」的工厂，返回 nil 会把下游的解引用晾在原地。
+    // 所以照原样造，只在文案卖会员时把它做成看不见的——调用方拿到的还是真视图，只是不长出来。
+    Class freePrompt = objc_getClass("RCFreePromptView");
+    if (freePrompt) {
+        void *(^block)(id, SEL, void *, void *, void *) = ^(id self_, SEL _cmd, void *title,
+                                                           void *actionTitle, void *done) {
+            void *result = nil;
+            if (XNARCFreePrompt) {
+                result = ((void *(*)(id, SEL, void *, void *, void *))XNARCFreePrompt)(
+                    self_, _cmd, title, actionTitle, done);
+            }
+            void *args[] = { title, actionTitle };
+            if (XNAIsMembershipAlert(@"free-prompt", args, 2)) XNAHideBuiltView(result);
+            return result;
+        };
+        XNAKeep(block);
+        XNAMuteEntry(freePrompt,
+                     NSSelectorFromString(@"RCFreePromptViewWithTitle:actionTitle:complete:"),
+                     "@40@0:8@16@24@?32", imp_implementationWithBlock(block), &XNARCFreePrompt);
+    }
+
+    Class vipPrompt = objc_getClass("RCVipPromptView");
+    if (vipPrompt) {
+        void *(^block)(id, SEL, void *) = ^(id self_, SEL _cmd, void *title) {
+            void *result = nil;
+            if (XNARCVipPrompt) {
+                result = ((void *(*)(id, SEL, void *))XNARCVipPrompt)(self_, _cmd, title);
+            }
+            if (XNAIsMembershipAlert(@"vip-prompt", &title, 1)) XNAHideBuiltView(result);
+            return result;
+        };
+        XNAKeep(block);
+        XNAMuteEntry(vipPrompt, NSSelectorFromString(@"RCVipPromptViewWithTitle:"),
+                     "@24@0:8@16", imp_implementationWithBlock(block), &XNARCVipPrompt);
+    }
+}
+
 #pragma mark - installation
 
 static BOOL XNASignaturePortable(const char *encoding, char *returnType) {
@@ -708,6 +909,7 @@ __attribute__((constructor)) static void XrkNoAdEntry(void) {
         XNALog(@"XrkNoAd attached to %@ / %@", NSProcessInfo.processInfo.processName,
                NSBundle.mainBundle.bundleIdentifier);
         XNAInstallAll(@"launch", YES);
+        XNAMuteMembershipAlerts();
         // 先认出来才能屏蔽：主线程扫界面层，记新出现的 App 自有视图、藏掉会员推广弹窗。
         // 挂到 common modes，否则滚动和手势期间根本不扫，弹窗会一直挂着。
         NSTimer *probe = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
