@@ -470,16 +470,17 @@ static NSInteger XNAIsPaywallDialog(UIView *root) {
 }
 
 // 壳常常是复用过的老视图，只有按钮是新长出来的，所以从按钮往上找壳，别等壳自己变「新鲜」。
-// 只爬 App 自己的视图：系统的转场/蒙层容器一路往上爬就到整个窗口了，那种不能碰。
+// 往上爬到撞到页面本体为止，取最后一个还合格的祖先；系统的转场壳是页面骨架的一环，
+// XNAIsPageBody 会把它挡下来，所以这里连系统容器也可以路过。
 static UIView *XNAOverlayHostForLeaf(UIView *leaf) {
-    UIView *top = leaf;
-    for (;;) {
-        UIView *parent = top.superview;
-        if (!parent || [parent isKindOfClass:UIWindow.class]) break;
-        if (!XNAClassIsAppOwned(parent.class) || XNAIsPageBody(parent)) break;
+    UIView *top = nil;
+    UIView *parent = leaf.superview;
+    for (NSUInteger hop = 0; parent && hop < 8; hop++) {
+        if ([parent isKindOfClass:UIWindow.class] || XNAIsPageBody(parent)) break;
         top = parent;
+        parent = parent.superview;
     }
-    return top == leaf ? nil : top;
+    return top;
 }
 
 // 一行的两个按钮：「立即升级」旁边还站着一个键，就是弹窗的按钮行。
@@ -576,6 +577,26 @@ static void XNAKillOverlay(UIView *view, NSString *via) {
     XNAKillHost(XNAOverlayShell(view), via);
 }
 
+// 没动手的时候把现场抄下来：这颗按钮同层都长了什么、父链上都是谁。看不清结构就只能在猜。
+static void XNALogLeafNeighbourhood(UIView *leaf, NSUInteger level, UIView *host) {
+    NSMutableString *siblings = [NSMutableString string];
+    for (UIView *sibling in leaf.superview.subviews) {
+        if (siblings.length > 56) break;
+        NSString *title = XNAViewText(sibling);
+        [siblings appendFormat:@" %@(%.0fx%.0f)%@", NSStringFromClass(sibling.class),
+                               CGRectGetWidth(sibling.bounds), CGRectGetHeight(sibling.bounds),
+                               title.length ? [NSString stringWithFormat:@":%@", title] : @""];
+    }
+    NSMutableString *chain = [NSMutableString string];
+    for (UIView *v = leaf.superview; v && chain.length < 56; v = v.superview) {
+        [chain appendFormat:@" <- %@(%.0fx%.0f)%@", NSStringFromClass(v.class),
+                            CGRectGetWidth(v.bounds), CGRectGetHeight(v.bounds),
+                            XNAClassIsAppOwned(v.class) ? @"" : @"/sys"];
+    }
+    XNALog(@"overlay-leaf d=%lu host=%@ 同层:%@ 父链:%@", (unsigned long)level,
+           host ? NSStringFromClass(host.class) : @"-", siblings, chain);
+}
+
 static void XNAScanOverlays(void) {
     static BOOL baselined = NO;
     BOOL report = baselined;
@@ -614,18 +635,16 @@ static void XNAScanOverlays(void) {
         if (view.isHidden || view.alpha < 0.05 || !view.window) continue;
         NSString *text = XNAViewText(view);
         if ([view isKindOfClass:UIControl.class] && XNAMatchText(text, XNAUpsellWords())) {
-            // 认得出「立即升级」就先把壳的形状记下来：这一路是猜的，错了要靠日志纠。
             XNALog(@"overlay-text %@ d=%lu frame=%@ text=%@", className, (unsigned long)level,
                    NSStringFromCGRect(view.frame), text);
             UIView *host = XNAOverlayHostForLeaf(view);
             BOOL pair = XNAIsPaywallDialog(host) == 2;
-            if (host && !XNAHostHoldsFullPage(host) &&
-                (pair || (!XNAIsInsidePage(host) && XNAIsButtonRowLeaf(view)))) {
-                if (!XNADismissPresentedHost(host, @"upsell")) {
-                    if (XNAIsCenteredCard(host)) XNAKillHost(host, @"upsell");
-                    else XNALog(@"overlay-miss %@ via upsell frame=%@", NSStringFromClass(host.class),
-                                NSStringFromCGRect(host.frame));
-                }
+            // 动手的门槛：文案配对齐全，或者按钮是一行两键的形状；壳还得像张浮着的卡片。
+            BOOL shaped = host && (XNAIsCenteredCard(host) || !XNAIsInsidePage(host));
+            if (host && shaped && (pair || XNAIsButtonRowLeaf(view)) && !XNAHostHoldsFullPage(host)) {
+                if (!XNADismissPresentedHost(host, @"upsell")) XNAKillHost(host, @"upsell");
+            } else {
+                XNALogLeafNeighbourhood(view, level, host);
             }
         } else if (level <= 6 && XNAIsPaywallDialog(view) == 2) {
             XNAKillOverlay(view, @"paywall");
